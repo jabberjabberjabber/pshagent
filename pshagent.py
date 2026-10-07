@@ -1789,7 +1789,7 @@ CONFIG_TOP_KEYS = {"defaults", "mcpServers"}
 CONFIG_DEFAULT_KEYS = {
     "base_url", "api_key", "model", "temperature", "max_tokens", "max_agent_steps",
     "request_timeout", "max_tool_result_chars", "confirmation", "tool_confirmation",
-    "disabled_tools", "xberg",
+    "disabled_tools", "xberg", "context_window", "context_relay",
 }
 MCP_SERVER_KEYS = {"command", "args", "env", "cwd", "enabled", "startup_timeout", "timeout"}
 # Accepted so entries can be pasted from other clients' configs.
@@ -2702,6 +2702,141 @@ def load_session_file(path: Path) -> dict[str, Any]:
     return session
 
 
+# ---------------------------------------------------------------- context meter
+
+
+def server_url(base_url: str, path: str) -> str:
+    """A URL on the server root, outside the /v1 API (llama.cpp /props, KoboldCpp /api)."""
+    parsed = urllib.parse.urlsplit(normalize_base_url(base_url))
+    root = parsed.path.rstrip("/")
+    for suffix in ("/chat/completions", "/v1"):
+        if root.endswith(suffix):
+            root = root[: -len(suffix)]
+    return urllib.parse.urlunsplit(parsed._replace(path=root + path))
+
+
+def get_json(url: str, api_key: str, timeout: int) -> Any:
+    request = urllib.request.Request(
+        url, headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
+    )
+    with urllib.request.urlopen(request, timeout=min(timeout, 5), context=API_SSL_CONTEXT) as response:
+        return json.load(response)
+
+
+def probe_context_window(base_url: str, api_key: str, model: str, timeout: int) -> tuple[int | None, str]:
+    """Ask the server how many tokens the model's context holds.
+
+    Tries llama.cpp (the model's meta in /v1/models, then /props, which in
+    router mode needs ?model=) and KoboldCpp (/api/extra/true_max_context_length).
+    Returns (size, where it came from) or (None, why not)."""
+    def positive(value: Any) -> int | None:
+        return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+    probes: list[tuple[str, Callable[[Any], Any]]] = [
+        (api_url(base_url, "models"), lambda body: next(
+            (entry.get("meta", {}).get("n_ctx") for entry in body.get("data", [])
+             if isinstance(entry, dict) and entry.get("id") == model and isinstance(entry.get("meta"), dict)),
+            None,
+        )),
+        (server_url(base_url, "/props?" + urllib.parse.urlencode({"model": model})),
+         lambda body: body.get("default_generation_settings", {}).get("n_ctx")),
+        (server_url(base_url, "/props"), lambda body: body.get("default_generation_settings", {}).get("n_ctx")),
+        (server_url(base_url, "/api/extra/true_max_context_length"), lambda body: body.get("value")),
+    ]
+    for url, pick in probes:
+        try:
+            size = positive(pick(get_json(url, api_key, timeout)))
+        except (urllib.error.URLError, ConnectionError, TimeoutError, ValueError, AttributeError, TypeError):
+            continue
+        if size:
+            return size, url
+    return None, "the server did not report it"
+
+
+def estimate_tokens(value: Any) -> int:
+    """Rough token count for text the server has not counted yet (~4 characters per token)."""
+    return len(json.dumps(value, ensure_ascii=False)) // 4 + 1
+
+
+class ContextMeter:
+    """Tracks how much of the context window the conversation uses.
+
+    The server's usage numbers from the last response are exact for everything
+    up to that response; only messages added since then are estimated.
+    """
+
+    LOW_FRACTION = 0.15
+
+    def __init__(self, window: int | None, source: str) -> None:
+        self.window = window
+        self.source = source
+        self._counted_messages = 0
+        self._counted_tokens: int | None = None
+
+    def reset(self) -> None:
+        """Call whenever history is replaced (/clear, /compact, /load, ...)."""
+        self._counted_messages = 0
+        self._counted_tokens = None
+
+    def record(self, response: dict[str, Any], message_count: int) -> None:
+        usage = response.get("usage")
+        if not isinstance(usage, dict):
+            return
+        prompt = usage.get("prompt_tokens")
+        completion = usage.get("completion_tokens") or 0
+        if isinstance(prompt, int) and prompt > 0 and isinstance(completion, int):
+            self._counted_tokens = prompt + completion
+            self._counted_messages = message_count
+
+    def used(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> tuple[int, bool]:
+        """(tokens in use, whether the number is exact)."""
+        if self._counted_tokens is not None and self._counted_messages <= len(messages):
+            new = messages[self._counted_messages:]
+            return self._counted_tokens + (estimate_tokens(new) if new else 0), not new
+        return estimate_tokens(messages) + estimate_tokens(tools), False
+
+    def describe(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> str:
+        used, exact = self.used(messages, tools)
+        about = "" if exact else "about "
+        if not self.window:
+            return f"{about}{used:,} tokens used (context size unknown)"
+        remaining = max(self.window - used, 0)
+        return (
+            f"{about}{used:,} of {self.window:,} tokens used ({100 * used // self.window}%), "
+            f"{about}{remaining:,} remaining"
+        )
+
+    def note(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> str:
+        """The line relayed to the model at the start of each generation."""
+        text = f"[pshagent context: {self.describe(messages, tools)}.]"
+        used, _ = self.used(messages, tools)
+        if self.window and self.window - used < self.window * self.LOW_FRACTION:
+            text += (
+                " [Context is nearly full: finish the current step, record what matters, "
+                "keep tool output small, and tell the user so they can /compact.]"
+            )
+        return text
+
+
+def with_context_note(messages: list[dict[str, Any]], note: str) -> list[dict[str, Any]]:
+    """Copy of messages with the note appended to the last one.
+
+    Appending to the newest message, instead of adding a system message, keeps
+    the cached prompt prefix intact and works with chat templates that reject a
+    system message anywhere but first. History itself is never changed."""
+    if not messages:
+        return messages
+    last = dict(messages[-1])
+    content = last.get("content")
+    if isinstance(content, str):
+        last["content"] = f"{content}\n\n{note}"
+    elif isinstance(content, list):
+        last["content"] = [*content, {"type": "text", "text": note}]
+    else:
+        return [*messages, {"role": "user", "content": note}]
+    return [*messages[:-1], last]
+
+
 def print_runtime_status(
     base_url: str,
     model: str,
@@ -2748,6 +2883,7 @@ def print_runtime_help(
         ("/tools", "List tools and confirmation settings (/tool is an alias)"),
         ("/tools NAME on|off", "Enable or disable a tool, then clear the session"),
         ("/compact", "Summarize history to save context space"),
+        ("/context [on|off]", "Show context use; turn relaying it to the model on or off"),
         ("/maxsteps [N]", "Show or set the maximum model turns per user message (N >= 1)"),
         ("/workdir", "Show the current working directory"),
         ("/workdir PATH", "Change directory, clear the session, restart MCP servers that follow it"),
@@ -2847,6 +2983,8 @@ def run_agent(
     disabled_tools: set[str] | None = None,
     mcp: McpManager | None = None,
     config_path: Path = DEFAULT_CONFIG_PATH,
+    context_window: int | None = None,
+    context_relay: bool = True,
 ) -> None:
     global MAX_TOOL_RESULT_CHARS
 
@@ -2868,6 +3006,20 @@ def run_agent(
         base_url, api_key, model = connection
     else:
         model = model or (models[0] if models else "local-model")
+
+    def make_meter() -> ContextMeter:
+        if context_window:
+            meter = ContextMeter(context_window, "--context-window / defaults.context_window")
+        else:
+            meter = ContextMeter(*probe_context_window(base_url, api_key, model, request_timeout))
+        if meter.window:
+            print(color("Context window:", ANSI_CYAN) + f" {meter.window:,} tokens (from {meter.source})")
+        else:
+            print(color("Context window unknown:", ANSI_YELLOW)
+                  + f" {meter.source}. Set defaults.context_window or --context-window.")
+        return meter
+
+    meter = make_meter()
 
     disabled_tools = set(disabled_tools or ())
     tool_confirmation = dict(tool_confirmation or {})
@@ -2927,6 +3079,16 @@ def run_agent(
                 max_tokens, tool_confirmation, max_agent_steps,
             )
             continue
+        if command == "/context":
+            setting = command_arg.lower()
+            if setting in ("on", "off"):
+                context_relay = setting == "on"
+            elif setting:
+                print("Usage: /context [on|off]\n")
+                continue
+            print(f"Context: {meter.describe(messages, available_tools)}.")
+            print(f"Relaying it to the model each generation: {'on' if context_relay else 'off'}.\n")
+            continue
         if command == "/maxsteps":
             if command_arg:
                 try:
@@ -2973,6 +3135,7 @@ def run_agent(
             except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
                 print(f"Cannot load session: {exc}\n")
                 continue
+            meter.reset()
             messages[:] = session["messages"]
             temperature = float(session["temperature"])
             max_tokens = session["max_tokens"]
@@ -3055,11 +3218,13 @@ def run_agent(
             else:
                 disabled_tools.remove(name)
             refresh_mcp_tools()
+            meter.reset()
             messages[:] = [{"role": "system", "content": system_prompt(disabled_tools)}]
             pending_interruption = False
             print(f"{name} is now {setting}. Conversation cleared.\n")
             continue
         if command == "/clear" and not command_arg:
+            meter.reset()
             messages[:] = [{"role": "system", "content": system_prompt(disabled_tools)}]
             pending_interruption = False
             refresh_mcp_tools()
@@ -3081,6 +3246,7 @@ def run_agent(
             except (EndpointUnavailableError, APIResponseError) as exc:
                 print(f"Compaction failed: {exc}. Conversation unchanged.\n")
                 continue
+            meter.reset()
             messages[:] = [
                 {"role": "system", "content": system_prompt(disabled_tools)},
                 {"role": "assistant", "content": f"Summary of the earlier session:\n{summary}"},
@@ -3102,6 +3268,7 @@ def run_agent(
             except OSError as exc:
                 print(f"Cannot change working directory: {exc}\n")
                 continue
+            meter.reset()
             messages[:] = [{"role": "system", "content": system_prompt(disabled_tools)}]
             pending_interruption = False
             mcp.restart_workdir_followers()
@@ -3174,6 +3341,7 @@ def run_agent(
             )
             if connection is not None:
                 base_url, api_key, model = connection
+                meter = make_meter()
                 print(f"Connection updated. Model: {model}; API key: {'set' if api_key else 'not set'}.\n")
             continue
         if command in {"/model", "/apikey", "/endpoint"}:
@@ -3203,7 +3371,10 @@ def run_agent(
                     base_url=base_url,
                     api_key=api_key,
                     model=model,
-                    messages=list(messages),
+                    messages=(
+                        with_context_note(messages, meter.note(messages, available_tools))
+                        if context_relay else list(messages)
+                    ),
                     tools=list(available_tools),
                     temperature=temperature,
                     max_tokens=max_tokens,
@@ -3227,6 +3398,7 @@ def run_agent(
                     print("Request stopped. Enter a new instruction.\n")
                     break
                 base_url, api_key, model = connection
+                meter = make_meter()
                 continue
             except APIResponseError as exc:
                 label = color("API error:", ANSI_RED, stderr=True)
@@ -3262,6 +3434,7 @@ def run_agent(
             if assistant.get("tool_calls"):
                 assistant_message["tool_calls"] = assistant["tool_calls"]
             messages.append(assistant_message)
+            meter.record(response, len(messages))
 
             reasoning = reasoning_text(assistant)
             if show_reasoning and reasoning:
@@ -3409,6 +3582,7 @@ def config_defaults(config: dict[str, Any], path: Path) -> dict[str, Any]:
         "max_agent_steps": positive_int,
         "request_timeout": positive_int,
         "max_tool_result_chars": positive_int,
+        "context_window": positive_int,
     }
     values: dict[str, Any] = {}
     for key, value in config["defaults"].items():
@@ -3421,6 +3595,10 @@ def config_defaults(config: dict[str, Any], path: Path) -> dict[str, Any]:
                 if isinstance(value, bool) or not isinstance(value, (int, float)):
                     raise ValueError("must be a number")
                 values[key] = numeric[key](str(value))
+            elif key == "context_relay":
+                if not isinstance(value, bool):
+                    raise ValueError("must be true or false")
+                values[key] = value
             elif key == "confirmation":
                 if value not in CONFIRMATION_MODES:
                     raise ValueError(f"must be one of {', '.join(CONFIRMATION_MODES)}")
@@ -3548,6 +3726,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Start with a tool (built-in or MCP) turned off. Adds to the config file's list.",
     )
     parser.add_argument(
+        "--context-window",
+        type=positive_int,
+        default=setting("context_window", None),
+        metavar="TOKENS",
+        help="Context size in tokens, if the server does not report it (llama.cpp and KoboldCpp do)",
+    )
+    parser.add_argument(
+        "--no-context-relay",
+        dest="context_relay",
+        action="store_false",
+        default=setting("context_relay", True),
+        help="Do not tell the model how much context remains at the start of each generation",
+    )
+    parser.add_argument(
         "--xberg",
         default=setting("xberg", "xberg"),
         metavar="PATH",
@@ -3626,6 +3818,8 @@ def main() -> None:
             disabled_tools=args.disabled_tools,
             mcp=mcp,
             config_path=args.config,
+            context_window=args.context_window,
+            context_relay=args.context_relay,
         )
     except KeyboardInterrupt:
         print("\nExiting.")
