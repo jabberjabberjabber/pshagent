@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""A tiny, cross-platform OpenAI Chat Completions-compatible local agent, for use in KoboldCpp.
+"""pshagent: a small, cross-platform agent for any OpenAI Chat Completions endpoint
+(KoboldCpp, llama.cpp, ...), with PowerShell as its shell on Windows.
 
-Nine built-in tools, plus tools exposed by KoboldCpp's MCP proxy:
+Nine built-in tools, plus tools from local MCP servers that the agent starts,
+owns, and stops (see the config file section below):
   - read
   - write
   - edit
@@ -15,11 +17,33 @@ Nine built-in tools, plus tools exposed by KoboldCpp's MCP proxy:
 By default, tool calls require confirmation (ask_user prompts directly).
 Per-tool /confirm overrides take precedence over the global confirmation mode.
 Uses only the Python standard library.
+
+Configuration lives in exactly one file, %APPDATA%\\pshagent\\config.json
+($XDG_CONFIG_HOME/pshagent/config.json elsewhere; --config overrides it):
+
+    {
+      "defaults": {"base_url": "http://grace:5001/v1", "confirmation": "on"},
+      "mcpServers": {
+        "file-index": {
+          "command": "uv",
+          "args": ["run", "--project", "E:/file-index/file-index-mcp", "file-index-mcp"],
+          "env": {"FIDX_ES": "C:/tools/es.exe"},
+          "enabled": true
+        }
+      }
+    }
+
+Precedence is command line, then OPENAI_* environment variables, then the
+config file, then built-in defaults. "enabled": false turns off that one entry
+and nothing else. A server without "cwd" runs in the agent's working directory
+and is restarted when /workdir changes it. Server stderr goes to
+%LOCALAPPDATA%\\pshagent\\logs\\mcp-<name>.log.
 """
 
 from __future__ import annotations
 
 import argparse
+import atexit
 import base64
 import getpass
 from html.parser import HTMLParser
@@ -40,6 +64,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import Counter
 from pathlib import Path
 from typing import Any, Callable
 
@@ -50,6 +75,8 @@ if os.name != "nt":
         pass  # Optional in some Python builds; plain input() still works.
 
 
+APP_NAME = "pshagent"
+APP_VERSION = "0.1.0"
 DEFAULT_MAX_TOOL_RESULT_CHARS = 24000
 MAX_TOOL_RESULT_CHARS = DEFAULT_MAX_TOOL_RESULT_CHARS
 NORMAL_TOOL_RESULT_DISPLAY_CHARS = 8000
@@ -58,9 +85,15 @@ MAX_AGENT_STEPS = 48
 MAX_FETCH_BYTES = 4000000
 MAX_VIEW_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_PROJECT_INSTRUCTION_CHARS = 12000
-DEFAULT_BASE_URL = os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:5001/v1")
-DEFAULT_API_KEY = os.getenv("OPENAI_API_KEY", "local")
-DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "")
+# The first of these found in the working directory is loaded.
+PROJECT_INSTRUCTION_FILES = ("AGENTS.md", "CLAUDE.md", "QWEN.md")
+DEFAULT_BASE_URL = "http://127.0.0.1:5001/v1"
+DEFAULT_API_KEY = "local"
+MCP_PROTOCOL_VERSION = "2025-06-18"
+DEFAULT_MCP_STARTUP_TIMEOUT = 60
+DEFAULT_MCP_CALL_TIMEOUT = 600
+MCP_STOP_GRACE_SECONDS = 3
+MCP_STDERR_TAIL_LINES = 40
 # Accept self-signed endpoint certificates for now; web_fetch keeps verification.
 API_SSL_CONTEXT = ssl._create_unverified_context()
 COLOR_STDOUT = False
@@ -72,6 +105,7 @@ ESCAPE_SEQUENCE_DRAIN_SECONDS = 0.10
 INTERRUPTED_TASK_NOTICE = "[Task was interrupted before the agent finished. Follow the new instruction below.]"
 # Older agents must reject sessions whose confirmation overrides they cannot enforce.
 SESSION_FORMAT_VERSION = 2
+SESSION_FORMATS = ("pshagent", "koboldcpp-agent")  # Written, then also accepted.
 CONFIRMATION_MODES = ("on", "off", "auto")
 
 ANSI_RESET = "\033[0m"
@@ -294,11 +328,13 @@ def standalone_escape(fd: int) -> bool:
 
 
 def run_interruptible_request(
-    operation: Callable[[], Any], on_interrupt: Callable[[], None] | None = None
+    operation: Callable[[], Any],
+    on_interrupt: Callable[[], None] | None = None,
+    label: str = "Waiting for model",
 ) -> Any:
-    """Let a standalone Escape close a model request and return to the prompt."""
+    """Let a standalone Escape abandon a model request or MCP call and return to the prompt."""
     if not (stream_is_interactive(sys.stdin) and stream_is_interactive(sys.stdout)):
-        with Throbber():
+        with Throbber(label):
             return operation()
 
     if os.name == "nt":
@@ -355,7 +391,7 @@ def run_interruptible_request(
                 on_interrupt()
             raise AgentInterrupted
 
-        with Throbber("Waiting for model (press Esc to interrupt)"):
+        with Throbber(f"{label} (press Esc to interrupt)"):
             while not finished.wait(0.1):
                 if pressed_escape():
                     interrupt()
@@ -388,8 +424,11 @@ SHELL_EXECUTABLE, SHELL_DESCRIPTION = resolve_shell()
 
 
 def load_workdir_instructions() -> str:
-    """Include only the current working directory's AGENTS.md, if present."""
-    path = Path.cwd() / "AGENTS.md"
+    """Include the working directory's first PROJECT_INSTRUCTION_FILES match, if any."""
+    candidates = [Path.cwd() / name for name in PROJECT_INSTRUCTION_FILES]
+    path = next((candidate for candidate in candidates if candidate.is_file()), None)
+    if path is None:
+        return ""
     try:
         with path.open(encoding="utf-8-sig") as source:
             instructions = source.read(MAX_PROJECT_INSTRUCTION_CHARS + 1)
@@ -404,8 +443,8 @@ def load_workdir_instructions() -> str:
     print(f"Loaded instructions: {path}")
     if len(instructions) > MAX_PROJECT_INSTRUCTION_CHARS:
         instructions = instructions[:MAX_PROJECT_INSTRUCTION_CHARS]
-        instructions += "\n[AGENTS.md truncated; read the file for the remaining instructions.]"
-        print(color(f"AGENTS.md truncated to {MAX_PROJECT_INSTRUCTION_CHARS} characters.", ANSI_YELLOW))
+        instructions += f"\n[{path.name} truncated; read the file for the remaining instructions.]"
+        print(color(f"{path.name} truncated to {MAX_PROJECT_INSTRUCTION_CHARS} characters.", ANSI_YELLOW))
     return (
         f"\nProject instructions from {path}:\n"
         "Follow these instructions when working in this project.\n\n"
@@ -454,7 +493,8 @@ def system_prompt(disabled_tools: set[str] | None = None) -> str:
     rules.append("After finishing tool use, briefly tell the user what was done.")
     return (
         f"You are a small, careful local computer assistant running on {platform.system()}.\n"
-        f"{introduction} The server may also supply MCP tools.\n\nRules:\n"
+        f"{introduction} Tools from local MCP servers may also be available; "
+        "their descriptions start with [MCP <server>].\n\nRules:\n"
         + "\n".join(f"- {rule}" for rule in rules)
         + "\n"
         + load_workdir_instructions()
@@ -1495,115 +1535,683 @@ def api_url(base_url: str, resource: str) -> str:
     return urllib.parse.urlunsplit(parsed._replace(path=path))
 
 
-def mcp_url(base_url: str) -> str:
-    """Return the KoboldCpp MCP proxy URL for an OpenAI-compatible base URL."""
-    parsed = urllib.parse.urlsplit(normalize_base_url(base_url))
-    return urllib.parse.urlunsplit(parsed._replace(path="/mcp", query="", fragment=""))
+# ---------------------------------------------------------------- config file
 
 
-def mcp_request(
-    base_url: str,
-    api_key: str,
-    method: str,
-    params: dict[str, Any],
-    timeout: int,
-) -> dict[str, Any]:
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": method,
-        "params": params,
-    }
-    request = urllib.request.Request(
-        mcp_url(base_url),
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
-        method="POST",
-    )
+def config_dir() -> Path:
+    """%APPDATA%\\pshagent on Windows; $XDG_CONFIG_HOME/pshagent elsewhere."""
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(base) / APP_NAME
+
+
+def log_dir() -> Path:
+    """%LOCALAPPDATA%\\pshagent\\logs on Windows; $XDG_STATE_HOME/pshagent/logs elsewhere."""
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    else:
+        base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(base) / APP_NAME / "logs"
+
+
+DEFAULT_CONFIG_PATH = config_dir() / "config.json"
+CONFIG_TOP_KEYS = {"defaults", "mcpServers"}
+CONFIG_DEFAULT_KEYS = {
+    "base_url", "api_key", "model", "temperature", "max_tokens", "max_agent_steps",
+    "request_timeout", "max_tool_result_chars", "confirmation", "tool_confirmation",
+    "disabled_tools",
+}
+MCP_SERVER_KEYS = {"command", "args", "env", "cwd", "enabled", "startup_timeout", "timeout"}
+# Accepted so entries can be pasted from other clients' configs.
+MCP_SERVER_IGNORED_KEYS = {"type", "versionNegotiation", "description"}
+
+
+class ConfigError(ValueError):
+    """The config file exists but cannot be used."""
+
+
+def load_config(path: Path) -> tuple[dict[str, Any], list[str]]:
+    """Read the one config file. A missing file means no MCP servers and no defaults."""
     try:
-        with urllib.request.urlopen(request, timeout=timeout, context=API_SSL_CONTEXT) as response:
-            value = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"MCP HTTP {exc.code}: {limit_text(body, 'error response')}") from exc
-    except (urllib.error.URLError, ConnectionError, TimeoutError) as exc:
-        raise RuntimeError(f"Could not reach KoboldCpp MCP proxy: {exc}") from exc
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"KoboldCpp MCP proxy returned invalid JSON: {exc}") from exc
-    if not isinstance(value, dict):
-        raise RuntimeError("KoboldCpp MCP proxy returned a non-object response")
-    if value.get("error") is not None:
-        raise RuntimeError(f"MCP error: {json.dumps(value['error'], ensure_ascii=False)}")
-    return value
+        with path.open(encoding="utf-8-sig") as source:
+            config = json.load(source)
+    except FileNotFoundError:
+        return {"defaults": {}, "mcpServers": {}}, []
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ConfigError(f"{path}: {exc}") from exc
+
+    def fail(message: str) -> ConfigError:
+        return ConfigError(f"{path}: {message}")
+
+    if not isinstance(config, dict):
+        raise fail("the root must be a JSON object")
+    warnings = [f"{path}: unknown key '{key}' ignored" for key in sorted(set(config) - CONFIG_TOP_KEYS)]
+
+    defaults = config.setdefault("defaults", {})
+    if not isinstance(defaults, dict):
+        raise fail("'defaults' must be an object")
+    for key in sorted(set(defaults) - CONFIG_DEFAULT_KEYS):
+        warnings.append(f"{path}: unknown key 'defaults.{key}' ignored")
+        del defaults[key]
+
+    servers = config.setdefault("mcpServers", {})
+    if not isinstance(servers, dict):
+        raise fail("'mcpServers' must be an object")
+    for name, spec in servers.items():
+        where = f"mcpServers.{name}"
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", name):
+            raise fail(f"server name {name!r} must be 1-32 letters, digits, _ or -")
+        if not isinstance(spec, dict):
+            raise fail(f"'{where}' must be an object")
+        if spec.get("type", "stdio") != "stdio":
+            raise fail(f"'{where}.type' is {spec['type']!r}; only stdio servers are supported")
+        for key in sorted(set(spec) - MCP_SERVER_KEYS - MCP_SERVER_IGNORED_KEYS):
+            warnings.append(f"{path}: unknown key '{where}.{key}' ignored")
+        if not isinstance(spec.get("command"), str) or not spec["command"].strip():
+            raise fail(f"'{where}.command' must be a non-empty string")
+        args = spec.setdefault("args", [])
+        if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+            raise fail(f"'{where}.args' must be an array of strings")
+        env = spec.setdefault("env", {})
+        if not isinstance(env, dict) or not all(
+            isinstance(key, str) and isinstance(value, str) for key, value in env.items()
+        ):
+            raise fail(f"'{where}.env' must map names to string values")
+        if spec.get("cwd") is not None and not isinstance(spec["cwd"], str):
+            raise fail(f"'{where}.cwd' must be a string")
+        if not isinstance(spec.setdefault("enabled", True), bool):
+            raise fail(f"'{where}.enabled' must be true or false")
+        for key in ("startup_timeout", "timeout"):
+            value = spec.get(key)
+            if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 1):
+                raise fail(f"'{where}.{key}' must be a positive integer (seconds)")
+    return config, warnings
 
 
-def discover_mcp_tools(
-    base_url: str, api_key: str, timeout: int
-) -> tuple[list[dict[str, Any]], set[str], list[str]]:
-    response = mcp_request(base_url, api_key, "tools/list", {}, timeout)
-    result = response.get("result", {})
-    raw_tools = result.get("tools", []) if isinstance(result, dict) else []
-    if not isinstance(raw_tools, list):
-        raise RuntimeError("MCP tools/list result does not contain a tools list")
+# ---------------------------------------------------------------- MCP client
 
-    tools: list[dict[str, Any]] = []
-    names: set[str] = set()
-    warnings: list[str] = []
-    reserved = set(TOOL_IMPL) | {"view_image"}
-    for item in raw_tools:
+
+class McpError(RuntimeError):
+    """An MCP server could not be started or did not answer a request."""
+
+
+class WindowsKillOnCloseJob:
+    """A job object that kills every process in it when its handle closes.
+
+    A server launched through a wrapper (uv -> python, npx -> node) leaves the
+    real server running if only the wrapper is killed. Every process a server
+    spawns joins its job, so closing the job ends the whole tree -- and Windows
+    closes the handle itself if the agent dies, so nothing is ever orphaned.
+    """
+
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+    JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+
+    def __init__(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        class BasicLimits(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class IoCounters(ctypes.Structure):
+            _fields_ = [(field, ctypes.c_uint64) for field in (
+                "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                "ReadTransferCount", "WriteTransferCount", "OtherTransferCount",
+            )]
+
+        class ExtendedLimits(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", BasicLimits),
+                ("IoInfo", IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        kernel32.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+        ]
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        self._kernel32 = kernel32
+        self._handle = kernel32.CreateJobObjectW(None, None)
+        if not self._handle:
+            raise OSError(ctypes.get_last_error(), "CreateJobObjectW failed")
+        limits = ExtendedLimits()
+        limits.BasicLimitInformation.LimitFlags = self.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not kernel32.SetInformationJobObject(
+            self._handle, self.JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(limits), ctypes.sizeof(limits),
+        ):
+            error = ctypes.get_last_error()
+            self.close()
+            raise OSError(error, "SetInformationJobObject failed")
+
+    def assign(self, process: subprocess.Popen[bytes]) -> None:
+        import ctypes
+
+        if not self._kernel32.AssignProcessToJobObject(self._handle, int(process._handle)):
+            raise OSError(ctypes.get_last_error(), "AssignProcessToJobObject failed")
+
+    def close(self) -> None:
+        if self._handle:
+            self._kernel32.CloseHandle(self._handle)
+            self._handle = None
+
+
+def format_mcp_result(result: Any) -> str:
+    """Flatten a tools/call result into text for the model."""
+    if not isinstance(result, dict):
+        return json.dumps(result, ensure_ascii=False)
+    parts: list[str] = []
+    for item in result.get("content") or []:
         if not isinstance(item, dict):
-            warnings.append("Skipped a malformed MCP tool entry")
             continue
-        name = item.get("name")
-        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
-            warnings.append(f"Skipped MCP tool with unsupported name: {name!r}")
-            continue
-        if name in reserved or name in names:
-            warnings.append(f"Skipped conflicting MCP tool name: {name}")
-            continue
-        description = item.get("description", "")
-        if not isinstance(description, str):
-            description = str(description)
-        parameters = item.get("inputSchema", {"type": "object"})
-        if not isinstance(parameters, dict):
-            warnings.append(f"Skipped MCP tool with invalid input schema: {name}")
-            continue
-        tools.append(
-            {
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "description": f"[MCP] {description}".strip(),
-                    "parameters": parameters,
+        kind = item.get("type")
+        if kind == "text":
+            parts.append(str(item.get("text", "")))
+        elif kind in ("image", "audio"):
+            size = len(item.get("data") or "") * 3 // 4
+            parts.append(f"[{kind} omitted: {item.get('mimeType', 'unknown type')}, about {size} bytes]")
+        elif kind == "resource":
+            resource = item.get("resource") or {}
+            text = resource.get("text")
+            parts.append(text if isinstance(text, str) else f"[resource: {resource.get('uri', '?')}]")
+        elif kind == "resource_link":
+            parts.append(f"[resource link: {item.get('uri', '?')}]")
+        else:
+            parts.append(json.dumps(item, ensure_ascii=False))
+    if not parts and result.get("structuredContent") is not None:
+        parts.append(json.dumps(result["structuredContent"], ensure_ascii=False))
+    text = "\n".join(parts) if parts else "(no content)"
+    return f"ERROR: {text}" if result.get("isError") else text
+
+
+class McpServer:
+    """One local MCP server, spoken to over stdio as newline-delimited JSON-RPC.
+
+    The agent owns the process: it starts it, and it stops it -- together with
+    everything it spawned -- on restart, reload, or exit.
+    """
+
+    def __init__(self, name: str, spec: dict[str, Any]) -> None:
+        self.name = name
+        self.spec = spec
+        self.enabled: bool = spec.get("enabled", True)
+        self.process: subprocess.Popen[bytes] | None = None
+        self.tools: list[dict[str, Any]] = []
+        self.error: str | None = None
+        self.server_info = ""
+        self.started_cwd = ""
+        self.tools_changed = False
+        self.log_path = log_dir() / f"mcp-{name}.log"
+        self._job: WindowsKillOnCloseJob | None = None
+        self._log: Any = None
+        self._write_lock = threading.Lock()
+        self._pending_lock = threading.Lock()
+        self._pending: dict[int, dict[str, Any]] = {}
+        self._next_id = 0
+        self._stderr_tail: list[str] = []
+
+    @property
+    def follows_workdir(self) -> bool:
+        """Servers without a configured cwd run in the agent's working directory."""
+        return not self.spec.get("cwd")
+
+    @property
+    def running(self) -> bool:
+        return self.process is not None and self.process.poll() is None
+
+    @property
+    def startup_timeout(self) -> int:
+        return self.spec.get("startup_timeout") or DEFAULT_MCP_STARTUP_TIMEOUT
+
+    @property
+    def call_timeout(self) -> int:
+        return self.spec.get("timeout") or DEFAULT_MCP_CALL_TIMEOUT
+
+    def start(self) -> None:
+        """Start (or restart) the process and complete the MCP handshake."""
+        self.stop()
+        self.error = None
+        self.tools = []
+        self.tools_changed = False
+        self._stderr_tail = []
+        cwd = self.spec.get("cwd") or os.getcwd()
+        env = os.environ.copy()
+        env.update(self.spec.get("env", {}))
+        command = self.spec["command"]
+        argv = [shutil.which(command, path=env.get("PATH")) or command, *self.spec.get("args", [])]
+        try:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._log = self.log_path.open("a", encoding="utf-8", errors="replace")
+            self._log.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} start in {cwd}: {argv}\n")
+            self._log.flush()
+        except OSError:
+            self._log = None
+
+        popen_options: dict[str, Any] = {}
+        if os.name == "nt":
+            # Own process group: Ctrl+C in the agent's console must not reach servers.
+            popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_options["start_new_session"] = True
+        try:
+            process = subprocess.Popen(
+                argv,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=cwd,
+                env=env,
+                **popen_options,
+            )
+        except OSError as exc:
+            self.error = f"cannot start {command}: {exc}"
+            raise McpError(self.error) from exc
+        if os.name == "nt":
+            try:
+                self._job = WindowsKillOnCloseJob()
+                self._job.assign(process)
+            except OSError as exc:
+                self._job = None
+                self._note(f"[pshagent] job object unavailable, child processes may outlive a stop: {exc}")
+        self.process = process
+        self.started_cwd = cwd
+        threading.Thread(target=self._read_stdout, args=(process,), daemon=True).start()
+        threading.Thread(target=self._read_stderr, args=(process,), daemon=True).start()
+
+        try:
+            initialized = self.request(
+                "initialize",
+                {
+                    "protocolVersion": MCP_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": APP_NAME, "version": APP_VERSION},
                 },
-            }
+                self.startup_timeout,
+            )
+            info = initialized.get("serverInfo") if isinstance(initialized, dict) else None
+            if isinstance(info, dict):
+                self.server_info = f"{info.get('name', '')} {info.get('version', '')}".strip()
+            self.notify("notifications/initialized")
+            self.tools = self.list_tools()
+        except McpError as exc:
+            self.error = str(exc)
+            self.stop()
+            raise
+
+    def list_tools(self) -> list[dict[str, Any]]:
+        tools: list[dict[str, Any]] = []
+        cursor = None
+        for _ in range(100):
+            params = {"cursor": cursor} if cursor else {}
+            result = self.request("tools/list", params, self.startup_timeout)
+            page = result.get("tools") if isinstance(result, dict) else None
+            if not isinstance(page, list):
+                raise McpError(f"{self.name}: tools/list did not return a tools array")
+            tools.extend(item for item in page if isinstance(item, dict))
+            cursor = result.get("nextCursor")
+            if not cursor:
+                break
+        return tools
+
+    def call_tool(self, tool: str, arguments: dict[str, Any]) -> str:
+        result = self.request("tools/call", {"name": tool, "arguments": arguments}, self.call_timeout)
+        return format_mcp_result(result)
+
+    def request(self, method: str, params: dict[str, Any], timeout: int) -> Any:
+        slot: dict[str, Any] = {"event": threading.Event()}
+        with self._pending_lock:
+            if not self.running:
+                raise McpError(self.dead_message())
+            self._next_id += 1
+            request_id = self._next_id
+            self._pending[request_id] = slot
+        try:
+            self._send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+        except OSError as exc:
+            with self._pending_lock:
+                self._pending.pop(request_id, None)
+            raise McpError(self.dead_message()) from exc
+        if not slot["event"].wait(timeout):
+            with self._pending_lock:
+                self._pending.pop(request_id, None)
+            self._cancel_request(request_id, "timeout")
+            raise McpError(f"MCP server {self.name}: {method} timed out after {timeout} s")
+        if "error" in slot:
+            error = slot["error"]
+            message = error.get("message", error) if isinstance(error, dict) else error
+            raise McpError(f"MCP server {self.name}: {message}")
+        return slot.get("result")
+
+    def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
+        message: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            message["params"] = params
+        try:
+            self._send(message)
+        except OSError:
+            pass
+
+    def cancel_pending(self, reason: str = "interrupted by the user") -> None:
+        """Ask the server to abandon every in-flight request and stop waiting for them."""
+        with self._pending_lock:
+            pending = list(self._pending.items())
+            self._pending.clear()
+        for request_id, slot in pending:
+            self._cancel_request(request_id, reason)
+            slot["error"] = {"message": f"request cancelled: {reason}"}
+            slot["event"].set()
+
+    def stop(self) -> None:
+        """End the server and everything it spawned. Safe to call repeatedly."""
+        process, self.process = self.process, None
+        job, self._job = self._job, None
+        if process is not None:
+            # MCP stdio shutdown: close stdin, give the server a moment to exit cleanly.
+            try:
+                if process.stdin:
+                    process.stdin.close()
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=MCP_STOP_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                pass
+            if job is not None:
+                job.close()  # Kills the remaining tree, including grandchildren.
+            elif os.name != "nt":
+                import signal
+
+                for sig in (signal.SIGTERM, signal.SIGKILL):
+                    try:
+                        os.killpg(process.pid, sig)
+                    except (ProcessLookupError, PermissionError):
+                        break
+                    try:
+                        process.wait(timeout=MCP_STOP_GRACE_SECONDS)
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+            if process.poll() is None:
+                process.kill()
+            try:
+                process.wait(timeout=MCP_STOP_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                pass
+            self._note(f"[pshagent] stopped (exit code {process.returncode})")
+        elif job is not None:
+            job.close()
+        with self._pending_lock:
+            pending = list(self._pending.values())
+            self._pending.clear()
+        for slot in pending:
+            slot["error"] = {"message": "server stopped"}
+            slot["event"].set()
+        if self._log is not None:
+            try:
+                self._log.close()
+            except OSError:
+                pass
+            self._log = None
+
+    def dead_message(self) -> str:
+        code = self.process.poll() if self.process is not None else None
+        state = f"exited with code {code}" if code is not None else "is not running"
+        tail = "\n".join(self._stderr_tail[-8:])
+        message = f"MCP server {self.name} {state}."
+        if tail:
+            message += f" Last stderr lines:\n{tail}"
+        return message + f"\nFull log: {self.log_path}"
+
+    def _send(self, message: dict[str, Any]) -> None:
+        process = self.process
+        if process is None or process.stdin is None:
+            raise OSError("server is not running")
+        data = (json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8")
+        with self._write_lock:
+            process.stdin.write(data)
+            process.stdin.flush()
+
+    def _cancel_request(self, request_id: int, reason: str) -> None:
+        self.notify("notifications/cancelled", {"requestId": request_id, "reason": reason})
+
+    def _note(self, line: str) -> None:
+        self._stderr_tail.append(line)
+        del self._stderr_tail[:-MCP_STDERR_TAIL_LINES]
+        log = self._log
+        if log is not None:
+            try:
+                log.write(line + "\n")
+                log.flush()
+            except (OSError, ValueError):
+                pass
+
+    def _read_stderr(self, process: subprocess.Popen[bytes]) -> None:
+        assert process.stderr is not None
+        for raw in process.stderr:
+            self._note(raw.decode("utf-8", errors="replace").rstrip())
+
+    def _read_stdout(self, process: subprocess.Popen[bytes]) -> None:
+        assert process.stdout is not None
+        for raw in process.stdout:
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                self._note(f"[non-JSON on stdout] {line[:500]}")
+                continue
+            if not isinstance(message, dict):
+                continue
+            if "method" in message:
+                self._handle_server_message(message)
+                continue
+            with self._pending_lock:
+                slot = self._pending.pop(message.get("id"), None)
+            if slot is None:
+                continue
+            if "error" in message:
+                slot["error"] = message["error"]
+            else:
+                slot["result"] = message.get("result")
+            slot["event"].set()
+
+        # EOF: the process is gone. Fail its waiters, unless it was already replaced.
+        if self.process is process:
+            process.wait()
+            with self._pending_lock:
+                pending = list(self._pending.values())
+                self._pending.clear()
+            for slot in pending:
+                slot["error"] = {"message": self.dead_message()}
+                slot["event"].set()
+
+    def _handle_server_message(self, message: dict[str, Any]) -> None:
+        method = message.get("method")
+        if "id" in message:  # A request from the server.
+            if method == "ping":
+                reply: dict[str, Any] = {"jsonrpc": "2.0", "id": message["id"], "result": {}}
+            else:
+                reply = {
+                    "jsonrpc": "2.0",
+                    "id": message["id"],
+                    "error": {"code": -32601, "message": f"{APP_NAME} does not support {method}"},
+                }
+            try:
+                self._send(reply)
+            except OSError:
+                pass
+        elif method == "notifications/tools/list_changed":
+            self.tools_changed = True
+        elif method == "notifications/message":
+            params = message.get("params") or {}
+            self._note(f"[{params.get('level', 'log')}] {json.dumps(params.get('data'), ensure_ascii=False)}")
+
+
+class McpManager:
+    """Every configured MCP server, and the tool names the model sees for them."""
+
+    def __init__(self) -> None:
+        self.servers: dict[str, McpServer] = {}
+        self.routes: dict[str, tuple[McpServer, str]] = {}
+
+    def configure(self, specs: dict[str, dict[str, Any]]) -> None:
+        self.stop_all()
+        self.servers = {name: McpServer(name, spec) for name, spec in specs.items()}
+        self.routes = {}
+
+    def start(self, names: list[str] | None = None) -> None:
+        """Start servers in parallel and report each one's outcome."""
+        targets = [
+            server for server in self.servers.values()
+            if server.enabled and (names is None or server.name in names)
+        ]
+        if not targets:
+            return
+
+        def start_one(server: McpServer) -> None:
+            try:
+                server.start()
+            except McpError:
+                pass  # Recorded in server.error and reported below.
+
+        with Throbber(f"Starting MCP servers: {', '.join(server.name for server in targets)}"):
+            threads = [threading.Thread(target=start_one, args=(server,), daemon=True) for server in targets]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        for server in targets:
+            if server.running:
+                print(color(f"MCP {server.name}:", ANSI_CYAN) + f" {len(server.tools)} tools, in {server.started_cwd}")
+            else:
+                print(color(f"MCP {server.name} failed:", ANSI_RED) + f" {server.error}")
+
+    def restart_workdir_followers(self) -> None:
+        names = [server.name for server in self.servers.values() if server.follows_workdir]
+        if names:
+            self.start(names)
+
+    def stop_all(self) -> None:
+        for server in self.servers.values():
+            server.stop()
+
+    def refresh_changed(self) -> bool:
+        """Re-list tools for servers that announced a change. Returns whether any did."""
+        changed = False
+        for server in self.servers.values():
+            if server.tools_changed and server.running:
+                server.tools_changed = False
+                try:
+                    server.tools = server.list_tools()
+                    changed = True
+                except McpError as exc:
+                    print(color(f"MCP {server.name}:", ANSI_YELLOW) + f" cannot refresh tools: {exc}")
+        return changed
+
+    def tool_definitions(self) -> tuple[list[dict[str, Any]], set[str], list[str]]:
+        """OpenAI tool entries for every running server's tools.
+
+        A tool keeps its own name unless that clashes with a built-in or with a
+        tool from another server; then it becomes '<server>__<tool>'.
+        """
+        reserved = {tool["function"]["name"] for tool in TOOLS}
+        running = [server for server in self.servers.values() if server.running]
+        counts = Counter(
+            item.get("name") for server in running for item in server.tools
         )
-        names.add(name)
-    return tools, names, warnings
+        tools: list[dict[str, Any]] = []
+        warnings: list[str] = []
+        self.routes = {}
+        for server in running:
+            for item in server.tools:
+                name = item.get("name")
+                if not isinstance(name, str) or not name:
+                    warnings.append(f"{server.name}: skipped a tool without a name")
+                    continue
+                exposed = name
+                if name in reserved or counts[name] > 1 or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
+                    exposed = re.sub(r"[^A-Za-z0-9_-]", "_", f"{server.name}__{name}")[:64]
+                if exposed in self.routes or exposed in reserved:
+                    warnings.append(f"{server.name}: skipped tool {name}; the name {exposed} is taken")
+                    continue
+                parameters = item.get("inputSchema")
+                if not isinstance(parameters, dict):
+                    parameters = {"type": "object", "properties": {}}
+                description = item.get("description") or ""
+                tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": exposed,
+                        "description": f"[MCP {server.name}] {description}".strip(),
+                        "parameters": parameters,
+                    },
+                })
+                self.routes[exposed] = (server, name)
+        return tools, set(self.routes), warnings
 
+    def call(self, exposed: str, arguments: dict[str, Any]) -> str:
+        server, tool = self.routes[exposed]
+        if not server.running:
+            # One automatic restart; a server that keeps dying needs a person.
+            print(color(f"MCP {server.name} is not running; restarting it.", ANSI_YELLOW))
+            try:
+                server.start()
+            except McpError as exc:
+                raise McpError(f"{exc}\nThe user can retry with /mcp restart {server.name}.") from exc
+        return server.call_tool(tool, arguments)
 
-def call_mcp_tool(
-    base_url: str,
-    api_key: str,
-    name: str,
-    arguments: dict[str, Any],
-    timeout: int,
-) -> str:
-    response = mcp_request(
-        base_url,
-        api_key,
-        "tools/call",
-        {"name": name, "arguments": arguments},
-        timeout,
-    )
-    result = response.get("result")
-    if isinstance(result, str):
-        return result
-    return json.dumps(result, ensure_ascii=False)
+    def cancel(self, exposed: str) -> None:
+        route = self.routes.get(exposed)
+        if route is not None:
+            route[0].cancel_pending()
+
+    def describe(self, config_path: Path) -> None:
+        print(color("MCP servers", ANSI_BOLD_CYAN) + f" (config: {config_path})")
+        if not self.servers:
+            print("  None configured. Add them under \"mcpServers\" in the config file, then /mcp reload.\n")
+            return
+        for server in self.servers.values():
+            if not server.enabled:
+                state = color("disabled in config", ANSI_YELLOW)
+            elif server.running:
+                state = (
+                    color("running", ANSI_GREEN)
+                    + f", pid {server.process.pid}, {len(server.tools)} tools, cwd {server.started_cwd}"
+                )
+                if server.follows_workdir:
+                    state += " (follows /workdir)"
+            elif server.error:
+                state = color("failed", ANSI_RED) + f": {server.error}"
+            else:
+                state = "stopped"
+            print(f"  {server.name}: {state}")
+            if server.running:
+                names = [exposed for exposed, (owner, _) in self.routes.items() if owner is server]
+                if names:
+                    print(f"    tools: {', '.join(names)}")
+            print(f"    log: {server.log_path}")
+        print()
 
 
 def probe_endpoint(base_url: str, api_key: str, timeout: int) -> tuple[bool, str, list[str]]:
@@ -1776,7 +2384,7 @@ def save_session_file(
 ) -> None:
     """Save all session state except model endpoint credentials."""
     session = {
-        "session_format": "koboldcpp-agent",
+        "session_format": SESSION_FORMATS[0],
         "session_format_version": SESSION_FORMAT_VERSION,
         # These fields intentionally resemble a stateless Chat Completions request.
         "messages": messages,
@@ -1806,8 +2414,8 @@ def load_session_file(path: Path) -> dict[str, Any]:
         session = json.load(source)
     if not isinstance(session, dict):
         raise ValueError("session root must be a JSON object")
-    if session.get("session_format") != "koboldcpp-agent":
-        raise ValueError("not a KoboldCpp Agent session")
+    if session.get("session_format") not in SESSION_FORMATS:
+        raise ValueError("not a pshagent session")
     if session.get("session_format_version") not in (1, SESSION_FORMAT_VERSION):
         raise ValueError(
             f"unsupported session format version: {session.get('session_format_version')!r}"
@@ -1905,13 +2513,16 @@ def print_runtime_help(
         ("/help", "Show this help"),
         ("/save FILE", "Save conversation and settings as JSON"),
         ("/load FILE", "Load conversation and settings from JSON"),
-        ("/clear", "Clear history and refresh MCP tools"),
+        ("/clear", "Clear history"),
+        ("/mcp", "List MCP servers: state, tools, working directory, log file"),
+        ("/mcp restart [NAME]", "Restart one MCP server, or all of them"),
+        ("/mcp reload", "Re-read MCP servers from the config file and restart them"),
         ("/tools", "List tools and confirmation settings (/tool is an alias)"),
         ("/tools NAME on|off", "Enable or disable a tool, then clear the session"),
         ("/compact", "Summarize history to save context space"),
         ("/maxsteps [N]", "Show or set the maximum model turns per user message (N >= 1)"),
         ("/workdir", "Show the current working directory"),
-        ("/workdir PATH", "Change directory and clear the session"),
+        ("/workdir PATH", "Change directory, clear the session, restart MCP servers that follow it"),
         ("/confirm", "Show global default confirmation and tool overrides"),
         ("/confirm on|off|auto", "Set global default: ask, approve, or automatic review"),
         ("/confirm NAME", "Show a tool's confirmation setting"),
@@ -2005,13 +2616,17 @@ def run_agent(
     no_color: bool = False,
     tool_confirmation: dict[str, str] | None = None,
     max_agent_steps: int = MAX_AGENT_STEPS,
+    disabled_tools: set[str] | None = None,
+    mcp: McpManager | None = None,
+    config_path: Path = DEFAULT_CONFIG_PATH,
 ) -> None:
     global MAX_TOOL_RESULT_CHARS
 
     base_url = normalize_base_url(base_url)
     show_reasoning = False
     verbose = False
-    print(color("***\nWelcome to KoboldCpp Agent", ANSI_BOLD_CYAN))
+    mcp = mcp or McpManager()
+    print(color("***\nWelcome to pshagent", ANSI_BOLD_CYAN))
     print(f"Connecting to {base_url}, please wait...")
     print(color("***", ANSI_BOLD_CYAN) + "\n")
     reachable, detail, models = probe_endpoint(base_url, api_key, request_timeout)
@@ -2026,27 +2641,19 @@ def run_agent(
     else:
         model = model or (models[0] if models else "local-model")
 
-    disabled_tools: set[str] = set()
+    disabled_tools = set(disabled_tools or ())
     tool_confirmation = dict(tool_confirmation or {})
     all_tools = list(TOOLS)
     available_tools = list(TOOLS)
     mcp_tool_names: set[str] = set()
 
     def refresh_mcp_tools() -> None:
+        """Rebuild the tool list from the servers' current tools. Starts nothing."""
         nonlocal all_tools, available_tools, mcp_tool_names
-        all_tools = list(TOOLS)
-        mcp_tool_names = set()
-        try:
-            mcp_tools, mcp_tool_names, warnings = discover_mcp_tools(
-                base_url, api_key, request_timeout
-            )
-            all_tools.extend(mcp_tools)
-            for warning in warnings:
-                print(color("MCP warning:", ANSI_YELLOW) + f" {warning}")
-            if mcp_tools:
-                print(color("MCP tools:", ANSI_CYAN) + f" {len(mcp_tools)} loaded")
-        except Exception as exc:
-            print(color("MCP unavailable:", ANSI_YELLOW) + f" {exc}")
+        mcp_tools, mcp_tool_names, warnings = mcp.tool_definitions()
+        all_tools = list(TOOLS) + mcp_tools
+        for warning in warnings:
+            print(color("MCP warning:", ANSI_YELLOW) + f" {warning}")
         available_tools = [
             tool for tool in all_tools
             if tool["function"]["name"] not in disabled_tools
@@ -2056,6 +2663,7 @@ def run_agent(
             print(color("Confirmation warning:", ANSI_YELLOW) +
                   f" {name} is unavailable. Its override is retained but has no effect until the tool is available.")
 
+    mcp.start()
     refresh_mcp_tools()
 
     messages: list[dict[str, Any]] = [
@@ -2067,7 +2675,7 @@ def run_agent(
         base_url, model, confirmation_mode, show_reasoning, verbose, max_tokens,
         tool_confirmation, max_agent_steps,
     )
-    print("\nKoboldCpp Agent has full shell access, exercise caution when approving commands.")
+    print("\npshagent has full shell access, exercise caution when approving commands.")
     print("Type " + color("/help", ANSI_YELLOW) + " for runtime commands.\n")
 
     while True:
@@ -2130,7 +2738,10 @@ def run_agent(
                 path = session_path(command_arg)
                 loaded_path = path.resolve()
                 session = load_session_file(path)
+                previous_workdir = Path.cwd()
                 os.chdir(session["workdir"])
+                if Path.cwd() != previous_workdir:
+                    mcp.restart_workdir_followers()
             except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
                 print(f"Cannot load session: {exc}\n")
                 continue
@@ -2155,6 +2766,35 @@ def run_agent(
                 base_url, model, confirmation_mode, show_reasoning, verbose,
                 max_tokens, tool_confirmation, max_agent_steps,
             )
+            print()
+            continue
+        if command == "/mcp":
+            parts = command_arg.split()
+            action = parts[0].lower() if parts else ""
+            if not action:
+                mcp.describe(config_path)
+                continue
+            if action == "restart" and len(parts) <= 2:
+                names = parts[1:] or None
+                if names and names[0] not in mcp.servers:
+                    print(f"Unknown MCP server: {names[0]}. Use /mcp to list servers.\n")
+                    continue
+                mcp.start(names)
+            elif action == "reload" and len(parts) == 1:
+                try:
+                    config, warnings = load_config(config_path)
+                except ConfigError as exc:
+                    print(color("Config error:", ANSI_RED) + f" {exc}. MCP servers unchanged.\n")
+                    continue
+                for warning in warnings:
+                    print(color("Config warning:", ANSI_YELLOW) + f" {warning}")
+                mcp.configure(config["mcpServers"])
+                mcp.start()
+                print("MCP servers reloaded. Other config defaults apply on the next start.")
+            else:
+                print("Usage: /mcp [restart [NAME] | reload]\n")
+                continue
+            refresh_mcp_tools()
             print()
             continue
         if command in {"/tool", "/tools"}:
@@ -2236,6 +2876,7 @@ def run_agent(
                 continue
             messages[:] = [{"role": "system", "content": system_prompt(disabled_tools)}]
             pending_interruption = False
+            mcp.restart_workdir_followers()
             refresh_mcp_tools()
             print(f"Working directory: {Path.cwd()}")
             print("Conversation cleared (/clear fresh session).\n")
@@ -2304,10 +2945,7 @@ def run_agent(
                 base_url, api_key, model, request_timeout
             )
             if connection is not None:
-                previous_url, previous_key = base_url, api_key
                 base_url, api_key, model = connection
-                if base_url != previous_url or api_key != previous_key:
-                    refresh_mcp_tools()
                 print(f"Connection updated. Model: {model}; API key: {'set' if api_key else 'not set'}.\n")
             continue
         if command in {"/model", "/apikey", "/endpoint"}:
@@ -2329,6 +2967,8 @@ def run_agent(
 
         # Continue calling the model until it returns a normal assistant answer.
         for _ in range(max_agent_steps):
+            if mcp.refresh_changed():
+                refresh_mcp_tools()
             try:
                 cancellation = RequestCancellation()
                 request_args = dict(
@@ -2358,10 +2998,7 @@ def run_agent(
                     pending_interruption = True
                     print("Request stopped. Enter a new instruction.\n")
                     break
-                previous_url, previous_key = base_url, api_key
                 base_url, api_key, model = connection
-                if base_url != previous_url or api_key != previous_key:
-                    refresh_mcp_tools()
                 continue
             except APIResponseError as exc:
                 label = color("API error:", ANSI_RED, stderr=True)
@@ -2498,12 +3135,10 @@ def run_agent(
                             else:
                                 try:
                                     if name in mcp_tool_names:
-                                        result = call_mcp_tool(
-                                            base_url,
-                                            api_key,
-                                            name,
-                                            args,
-                                            request_timeout,
+                                        result = run_interruptible_request(
+                                            lambda: mcp.call(name, args),
+                                            on_interrupt=lambda: mcp.cancel(name),
+                                            label=f"Running {display_name}",
                                         )
                                     elif name == "view_image":
                                         result = tool_view_image(
@@ -2512,6 +3147,9 @@ def run_agent(
                                         )
                                     else:
                                         result = TOOL_IMPL[name](args)
+                                except AgentInterrupted:
+                                    pending_interruption = True
+                                    result = "CANCELLED BY USER: The user interrupted this tool call; it may have partly run."
                                 except subprocess.TimeoutExpired:
                                     result = "ERROR: shell command timed out"
                                 except Exception as exc:
@@ -2535,65 +3173,131 @@ def run_agent(
             print(f"Agent stopped: reached the limit of {max_agent_steps} consecutive tool/model turns.\n")
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Tiny local tool-using LLM agent")
+def config_defaults(config: dict[str, Any], path: Path) -> dict[str, Any]:
+    """Check the config file's "defaults" with the same rules as the command line."""
+    numeric = {
+        "temperature": temperature_value,
+        "max_tokens": positive_int,
+        "max_agent_steps": positive_int,
+        "request_timeout": positive_int,
+        "max_tool_result_chars": positive_int,
+    }
+    values: dict[str, Any] = {}
+    for key, value in config["defaults"].items():
+        try:
+            if key in ("base_url", "api_key", "model"):
+                if not isinstance(value, str):
+                    raise ValueError("must be a string")
+                values[key] = value
+            elif key in numeric:
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise ValueError("must be a number")
+                values[key] = numeric[key](str(value))
+            elif key == "confirmation":
+                if value not in CONFIRMATION_MODES:
+                    raise ValueError(f"must be one of {', '.join(CONFIRMATION_MODES)}")
+                values[key] = value
+            elif key == "tool_confirmation":
+                if not isinstance(value, dict) or not all(
+                    isinstance(name, str) and mode in CONFIRMATION_MODES for name, mode in value.items()
+                ):
+                    raise ValueError("must map tool names to on, off, or auto")
+                values[key] = dict(value)
+            elif key == "disabled_tools":
+                if not isinstance(value, list) or not all(isinstance(name, str) for name in value):
+                    raise ValueError("must be an array of tool names")
+                values[key] = list(value)
+        except (ValueError, argparse.ArgumentTypeError) as exc:
+            raise ConfigError(f"{path}: defaults.{key} {exc}") from exc
+    return values
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    early = argparse.ArgumentParser(add_help=False)
+    early.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
+    config_path = early.parse_known_args(argv)[0].config.expanduser()
+
+    parser = argparse.ArgumentParser(
+        description="Small local tool-using LLM agent with local MCP servers",
+        epilog=(
+            "Each setting comes from the first of: command line, OPENAI_BASE_URL / "
+            "OPENAI_API_KEY / OPENAI_MODEL, the config file's \"defaults\", built-in default."
+        ),
+    )
+    try:
+        config, warnings = load_config(config_path)
+        defaults = config_defaults(config, config_path)
+    except ConfigError as exc:
+        parser.error(str(exc))
+
+    def setting(key: str, builtin: Any, env: str | None = None) -> Any:
+        if env and os.getenv(env):
+            return os.getenv(env)
+        return defaults.get(key, builtin)
+
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=config_path,
+        help=f"The config file (default: {DEFAULT_CONFIG_PATH})",
+    )
     parser.add_argument(
         "--base-url",
-        default=DEFAULT_BASE_URL,
-        help="OpenAI-compatible base URL (default: %(default)s or OPENAI_BASE_URL)",
+        default=setting("base_url", DEFAULT_BASE_URL, "OPENAI_BASE_URL"),
+        help="OpenAI-compatible base URL (now: %(default)s)",
     )
     parser.add_argument(
         "--api-key",
-        default=DEFAULT_API_KEY,
-        help="API key for model requests and the KoboldCpp MCP proxy (default: OPENAI_API_KEY or 'local')",
+        default=setting("api_key", DEFAULT_API_KEY, "OPENAI_API_KEY"),
+        help="API key for model requests",
     )
     parser.add_argument(
         "--model",
-        default=DEFAULT_MODEL,
-        help="Model name (default: OPENAI_MODEL or the first model from /models; falls back to 'local-model')",
+        default=setting("model", "", "OPENAI_MODEL"),
+        help="Model name (default: the first model from /models; falls back to 'local-model')",
     )
     parser.add_argument(
         "--temperature",
         type=temperature_value,
-        default=DEFAULT_TEMPERATURE,
-        help=f"Sampling temperature (default: {DEFAULT_TEMPERATURE})",
+        default=setting("temperature", DEFAULT_TEMPERATURE),
+        help="Sampling temperature (now: %(default)s)",
     )
     parser.add_argument(
         "--max-tool-result-chars",
         type=positive_int,
-        default=DEFAULT_MAX_TOOL_RESULT_CHARS,
+        default=setting("max_tool_result_chars", DEFAULT_MAX_TOOL_RESULT_CHARS),
         metavar="CHARS",
-        help="Maximum characters in tool argument previews and tool results (default: %(default)s)",
+        help="Maximum characters in tool argument previews and tool results (now: %(default)s)",
     )
     parser.add_argument(
         "--max-tokens",
         type=positive_int,
-        default=None,
+        default=setting("max_tokens", None),
         metavar="TOKENS",
         help="Maximum output tokens per model response (omitted by default)",
     )
     parser.add_argument(
         "--max-agent-steps",
         type=positive_int,
-        default=MAX_AGENT_STEPS,
+        default=setting("max_agent_steps", MAX_AGENT_STEPS),
         metavar="STEPS",
-        help="Maximum model turns per user message (default: %(default)s)",
+        help="Maximum model turns per user message (now: %(default)s)",
     )
     parser.add_argument(
         "--request-timeout",
         type=positive_int,
-        default=600,
+        default=setting("request_timeout", 600),
         metavar="SECONDS",
-        help="Model request timeout in seconds (default: %(default)s)",
+        help="Model request timeout in seconds (now: %(default)s)",
     )
     parser.add_argument(
         "--confirmation",
         choices=CONFIRMATION_MODES,
-        default="on",
+        default=setting("confirmation", "on"),
         help=(
             "Default tool confirmation: 'on' asks, 'off' approves, and 'auto' asks "
             "when automatic review does not approve; write/edit paths outside the "
-            "working directory always ask in auto mode (default: %(default)s). "
+            "working directory always ask in auto mode (now: %(default)s). "
             "Per-tool overrides take precedence; ask_user prompts directly unless overridden."
         ),
     )
@@ -2603,14 +3307,29 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=[],
         metavar="NAME=MODE",
-        help="Override a tool's confirmation with on, off, or auto. Repeat for multiple tools; last value wins.",
+        help=(
+            "Override a tool's confirmation with on, off, or auto. Repeat for multiple "
+            "tools; last value wins, and wins over the config file."
+        ),
+    )
+    parser.add_argument(
+        "--disable-tool",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="Start with a tool (built-in or MCP) turned off. Adds to the config file's list.",
     )
     parser.add_argument(
         "--no-color",
         action="store_true",
         help="Disable colored terminal output.",
     )
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    args.tool_confirmation = {**defaults.get("tool_confirmation", {}), **dict(args.tool_confirmation)}
+    args.disabled_tools = set(defaults.get("disabled_tools", [])) | set(args.disable_tool)
+    args.config_data = config
+    args.config_warnings = warnings
+    return args
 
 
 def tool_confirmation_value(value: str) -> tuple[str, str]:
@@ -2646,18 +3365,27 @@ def main() -> None:
     args = parse_args()
     MAX_TOOL_RESULT_CHARS = args.max_tool_result_chars
     configure_colors(disabled=args.no_color)
+    for warning in args.config_warnings:
+        print(color("Config warning:", ANSI_YELLOW) + f" {warning}")
+    mcp = McpManager()
+    mcp.configure(args.config_data["mcpServers"])
+    # Servers die with the agent: on normal exit here, and via job objects otherwise.
+    atexit.register(mcp.stop_all)
     try:
         run_agent(
             base_url=args.base_url,
             api_key=args.api_key,
             model=args.model,
             confirmation_mode=args.confirmation,
-            tool_confirmation=dict(args.tool_confirmation),
+            tool_confirmation=args.tool_confirmation,
             temperature=args.temperature,
             max_tokens=args.max_tokens,
             max_agent_steps=args.max_agent_steps,
             request_timeout=args.request_timeout,
             no_color=args.no_color,
+            disabled_tools=args.disabled_tools,
+            mcp=mcp,
+            config_path=args.config,
         )
     except KeyboardInterrupt:
         print("\nExiting.")
@@ -2665,7 +3393,8 @@ def main() -> None:
         label = color("Fatal error:", ANSI_RED, stderr=True)
         print(f"{label} {exc}", file=sys.stderr)
         sys.exit(1)
-
+    finally:
+        mcp.stop_all()
 
 if __name__ == "__main__":
     main()
