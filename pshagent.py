@@ -2,7 +2,7 @@
 """pshagent: a small, cross-platform agent for any OpenAI Chat Completions endpoint
 (KoboldCpp, llama.cpp, ...), with PowerShell as its shell on Windows.
 
-Ten built-in tools, plus tools from local MCP servers that the agent starts,
+Eleven built-in tools, plus tools from local MCP servers that the agent starts,
 owns, and stops (see the config file section below):
   - read
   - write
@@ -13,6 +13,7 @@ owns, and stops (see the config file section below):
   - web_fetch
   - view_image
   - extract_text (needs the xberg CLI)
+  - extract_keywords (needs the xberg CLI)
   - ask_user
 
 By default, tool calls require confirmation (ask_user prompts directly).
@@ -482,6 +483,8 @@ def system_prompt(disabled_tools: set[str] | None = None) -> str:
         rules.append("Use view_image to inspect a local image file with a computer vision software; it returns a text description.")
     if "extract_text" in enabled:
         rules.append("Use extract_text for PDFs, Office documents, e-mail, and images of text; use read only for plain text files.")
+    if "extract_keywords" in enabled:
+        rules.append("Use extract_keywords to learn what a document is about cheaply, before or instead of reading its full text.")
     if "ask_user" in enabled:
         rules.append("Use ask_user when you need an answer from the user before proceeding.")
     rules.extend([
@@ -754,6 +757,44 @@ TOOLS = [
                         "minimum": 0,
                         "default": 0,
                         "description": "Return text from this character offset, to continue a truncated result. Keep the same format when continuing.",
+                    },
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "extract_keywords",
+            "description": "Summarize what a document is about without reading it: the top keywords (xberg YAKE or RAKE), detected language, and document metadata such as title, author, dates, and page count. Works on the same formats as extract_text.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the document."},
+                    "algorithm": {
+                        "type": "string",
+                        "enum": ["yake", "rake"],
+                        "default": "yake",
+                        "description": "yake: short, distinctive terms (default). rake: longer multi-word phrases.",
+                    },
+                    "max_keywords": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "default": 10,
+                    },
+                    "language": {
+                        "type": "string",
+                        "default": "en",
+                        "description": "Stopword language code for keyword extraction, such as en, de, fr.",
+                    },
+                    "ocr": {
+                        "type": "string",
+                        "enum": ["auto", "force", "off"],
+                        "default": "auto",
+                        "description": "auto: OCR only where there is no text layer, and retry with OCR if nothing came back. force: OCR every page. off: never OCR.",
                     },
                 },
                 "required": ["path"],
@@ -1187,13 +1228,21 @@ def tool_web_fetch(args: dict[str, Any]) -> str:
         return limit_text(metadata + content, "web response")
 
 
-def xberg_extract(path: Path, ocr: str, content_format: str, force_ocr: bool) -> dict[str, Any]:
+def xberg_extract(
+    path: Path,
+    ocr: str,
+    content_format: str,
+    force_ocr: bool,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     executable = shutil.which(XBERG_COMMAND)
     if executable is None:
         raise RuntimeError(
             f"xberg was not found ({XBERG_COMMAND}). Set defaults.xberg in the config file or pass --xberg."
         )
     argv = [executable, "extract", str(path), "-f", "json", "--content-format", content_format]
+    if config:
+        argv += ["--config-json", json.dumps(config)]
     if ocr == "off":
         argv += ["--disable-ocr", "true"]
     elif force_ocr:
@@ -1221,28 +1270,26 @@ def xberg_extract(path: Path, ocr: str, content_format: str, force_ocr: bool) ->
     return result
 
 
-def tool_extract_text(args: dict[str, Any]) -> str:
+def xberg_document(
+    args: dict[str, Any], content_format: str, config: dict[str, Any] | None = None
+) -> tuple[Path, dict[str, Any], list[str]]:
+    """Validate path/ocr, extract, and retry once with OCR if no text came back.
+
+    Returns the path, xberg's result, and the header lines both tools share."""
     path = Path(args["path"]).expanduser()
     if not path.is_file():
         raise FileNotFoundError(f"No such file: {path}")
     ocr = args.get("ocr", "auto")
-    content_format = args.get("format", "markdown")
-    start = args.get("start_char", 0)
     if ocr not in ("auto", "force", "off"):
         raise ValueError("ocr must be auto, force, or off")
-    if content_format not in ("markdown", "plain"):
-        raise ValueError("format must be markdown or plain")
-    if not isinstance(start, int) or isinstance(start, bool) or start < 0:
-        raise ValueError("start_char must be a non-negative integer")
 
-    result = xberg_extract(path, ocr, content_format, force_ocr=ocr == "force")
+    result = xberg_extract(path, ocr, content_format, ocr == "force", config)
     retried = False
     if ocr == "auto" and not str(result.get("content") or "").strip():
         # Scans often have an empty or junk text layer; one OCR pass settles it.
-        result = xberg_extract(path, ocr, content_format, force_ocr=True)
+        result = xberg_extract(path, ocr, content_format, True, config)
         retried = True
 
-    content = str(result.get("content") or "")
     method = str(result.get("extraction_method", "unknown"))
     if retried:
         method += " (retried with OCR after no text)"
@@ -1250,8 +1297,21 @@ def tool_extract_text(args: dict[str, Any]) -> str:
         f"File: {path}",
         f"Type: {result.get('mime_type', 'unknown')}",
         f"Method: {method}",
-        f"Characters: {len(content)}",
+        f"Characters: {len(str(result.get('content') or ''))}",
     ]
+    return path, result, header
+
+
+def tool_extract_text(args: dict[str, Any]) -> str:
+    content_format = args.get("format", "markdown")
+    start = args.get("start_char", 0)
+    if content_format not in ("markdown", "plain"):
+        raise ValueError("format must be markdown or plain")
+    if not isinstance(start, int) or isinstance(start, bool) or start < 0:
+        raise ValueError("start_char must be a non-negative integer")
+
+    _, result, header = xberg_document(args, content_format)
+    content = str(result.get("content") or "")
     if result.get("tables"):
         header.append(f"Tables: {len(result['tables'])}")
     if start:
@@ -1260,8 +1320,64 @@ def tool_extract_text(args: dict[str, Any]) -> str:
     return limit_text("\n".join(header) + "\n\n" + body, "extracted text")
 
 
+# Bulky or internal fields that say nothing about what a document is.
+# app_properties is Office bookkeeping (template, edit time, security flags).
+XBERG_METADATA_SKIP = {"additional", "app_properties", "boundaries", "output_format"}
+
+
+def prune_metadata(value: Any) -> Any:
+    """Drop empty values and bookkeeping fields from xberg's metadata, recursively."""
+    if isinstance(value, dict):
+        if isinstance(value.get("total_count"), int) and "unit_type" in value:
+            return value["total_count"]  # Page structure -> just the page count.
+        pruned = {key: prune_metadata(item) for key, item in value.items() if key not in XBERG_METADATA_SKIP}
+        return {key: item for key, item in pruned.items() if item not in (None, "", [], {})}
+    if isinstance(value, list):
+        pruned_items = [prune_metadata(item) for item in value]
+        return [item for item in pruned_items if item not in (None, "", [], {})]
+    return value
+
+
+def tool_extract_keywords(args: dict[str, Any]) -> str:
+    algorithm = args.get("algorithm", "yake")
+    max_keywords = args.get("max_keywords", 10)
+    language = args.get("language", "en")
+    if algorithm not in ("yake", "rake"):
+        raise ValueError("algorithm must be yake or rake")
+    if not isinstance(max_keywords, int) or isinstance(max_keywords, bool) or not 1 <= max_keywords <= 50:
+        raise ValueError("max_keywords must be an integer from 1 to 50")
+    if not isinstance(language, str) or not re.fullmatch(r"[a-z]{2,3}", language):
+        raise ValueError("language must be a 2- or 3-letter language code, such as en")
+
+    config = {
+        "keywords": {"algorithm": algorithm, "max_keywords": max_keywords, "language": language},
+        "language_detection": {"enabled": True},
+    }
+    _, result, header = xberg_document(args, "plain", config)
+    languages = result.get("detected_languages")
+    if isinstance(languages, list) and languages:
+        header.append(f"Detected languages: {', '.join(map(str, languages))}")
+
+    lines = [*header, "", f"Keywords ({algorithm}, higher score = more relevant):"]
+    keywords = result.get("extracted_keywords") or []
+    for keyword in keywords:
+        if isinstance(keyword, dict):
+            score = keyword.get("score")
+            score_text = f"{score:.3f}" if isinstance(score, (int, float)) else "?"
+            lines.append(f"  {score_text}  {keyword.get('text', '')}")
+        else:
+            lines.append(f"  {keyword}")
+    if not keywords:
+        lines.append("  (none: no usable text)")
+
+    metadata = prune_metadata(result.get("metadata") or {})
+    lines += ["", "Metadata:", json.dumps(metadata, ensure_ascii=False) if metadata else "(none)"]
+    return limit_text("\n".join(lines), "keyword result")
+
+
 TOOL_IMPL = {
     "extract_text": tool_extract_text,
+    "extract_keywords": tool_extract_keywords,
     "read": tool_read,
     "write": tool_write,
     "edit": tool_edit,
@@ -3435,7 +3551,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--xberg",
         default=setting("xberg", "xberg"),
         metavar="PATH",
-        help="xberg CLI for extract_text; the tool is turned off if it is not found (now: %(default)s)",
+        help="xberg CLI for extract_text and extract_keywords; they are turned off if it is not found (now: %(default)s)",
     )
     parser.add_argument(
         "--no-color",
@@ -3486,9 +3602,11 @@ def main() -> None:
     for warning in args.config_warnings:
         print(color("Config warning:", ANSI_YELLOW) + f" {warning}")
     XBERG_COMMAND = args.xberg
-    if shutil.which(XBERG_COMMAND) is None and "extract_text" not in args.disabled_tools:
-        args.disabled_tools.add("extract_text")
-        print(color("extract_text is off:", ANSI_YELLOW) + f" xberg not found ({XBERG_COMMAND}).")
+    if shutil.which(XBERG_COMMAND) is None:
+        xberg_tools = {"extract_text", "extract_keywords"} - args.disabled_tools
+        if xberg_tools:
+            args.disabled_tools |= xberg_tools
+            print(color(f"{' and '.join(sorted(xberg_tools))} off:", ANSI_YELLOW) + f" xberg not found ({XBERG_COMMAND}).")
     mcp = McpManager()
     mcp.configure(args.config_data["mcpServers"])
     # Servers die with the agent: on normal exit here, and via job objects otherwise.
