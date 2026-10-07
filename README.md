@@ -32,4 +32,4 @@ Remaining context is relayed to the agent after every call.
  
 ## Use as Agentic File Sorter
 
-When combined with the [Agentic File Sorter]() MCP server and prompt, you can use this to organize large, disorganized directory trees safely and automatically. 
+When combined with the [Agentic File Sorter](https://github.com/jabberjabberjabber/agentic-file-sorter) MCP server and prompt, you can use this to organize large, disorganized directory trees safely and automatically. 
