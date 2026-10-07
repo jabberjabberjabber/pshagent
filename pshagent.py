@@ -2,6 +2,18 @@
 """pshagent: a small, cross-platform agent for any OpenAI Chat Completions endpoint
 (KoboldCpp, llama.cpp, ...), with PowerShell as its shell on Windows.
 
+***
+Based on koboldcpp's agent: https://github.com/lostruins/koboldcpp
+***
+
+Differences from kobo agent:
+
+ - MCP support on client 
+ - Relays remaining context to agent on every call
+ - Full document and image extraction through xberg
+ - Keywording using YAKE/RAKE through xberg
+ - Saves config in appdata
+ 
 Eleven built-in tools, plus tools from local MCP servers that the agent starts,
 owns, and stops (see the config file section below):
   - read
@@ -24,11 +36,11 @@ Configuration lives in exactly one file, %APPDATA%\\pshagent\\config.json
 ($XDG_CONFIG_HOME/pshagent/config.json elsewhere; --config overrides it):
 
     {
-      "defaults": {"base_url": "http://grace:5001/v1", "confirmation": "on"},
+      "defaults": {"base_url": "http://localhost:5001/v1", "confirmation": "on"},
       "mcpServers": {
         "file-index": {
           "command": "uv",
-          "args": ["run", "--project", "E:/file-index/file-index-mcp", "file-index-mcp"],
+          "args": ["run", "--project", "dir/to/mcp", "mcp"],
           "env": {"FIDX_ES": "C:/tools/es.exe"},
           "enabled": true
         }
@@ -88,7 +100,7 @@ MAX_FETCH_BYTES = 4000000
 MAX_VIEW_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_PROJECT_INSTRUCTION_CHARS = 12000
 # The first of these found in the working directory is loaded.
-PROJECT_INSTRUCTION_FILES = ("AGENTS.md", "CLAUDE.md", "QWEN.md")
+PROJECT_INSTRUCTION_FILES = ("AGENTS.md", "CLAUDE.md")
 DEFAULT_BASE_URL = "http://127.0.0.1:5001/v1"
 DEFAULT_API_KEY = "local"
 MCP_PROTOCOL_VERSION = "2025-06-18"
